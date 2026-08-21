@@ -186,6 +186,14 @@ AGENT_CONFIG_PATHS=(
   "$HOME/.claude/agents"
   "$HOME/.claude/skills"
   "$HOME/.claude/hooks"
+  # settings.json above carries enabledPlugins and extraKnownMarketplaces, so
+  # without these the guest agent starts with plugins enabled and nothing to
+  # load them from. Runtime state (data/, *-cache.json) stays on the host.
+  "$HOME/.claude/plugins/installed_plugins.json"
+  "$HOME/.claude/plugins/known_marketplaces.json"
+  "$HOME/.claude/plugins/marketplaces"
+  "$HOME/.claude/plugins/cache"
+  "$HOME/.claude/plugins/user"
   "$HOME/.codex/AGENTS.md"
   "$HOME/.codex/config.toml"
   "$HOME/.codex/rules"
@@ -781,7 +789,7 @@ apply_golden_provisioning() { # $1 golden $2 system script $3 user script
       || { warn "project system provisioning failed"; return 1; }
   fi
   if [[ -n "$user" ]]; then
-    log "Applying project user provisioning to $golden…"
+    log "Applying project user provisioning to ${golden}…"
     printf '%s\n' "$user" \
       | limactl shell "$golden" -- bash -l -e -s \
       || { warn "project user provisioning failed"; return 1; }
@@ -1011,7 +1019,15 @@ renew_gh_proxy_capability() { # $1 Lima instance $2 bare http proxy URL
 proxy_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -q 'devbox-ai-proxy'; }
 proxy_self_renewal_health() { curl -fsS --max-time 1 "http://127.0.0.1:$1/_devbox" 2>/dev/null | grep -q 'gh-self-renewal'; }
 # is anything at all listening on the port?
-proxy_port_open() { timeout 1 bash -c ">/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
+# BSD hosts ship no `timeout`, and a missing one made this always false: the
+# port-conflict warning below never fired, and the drain loop after a proxy
+# restart gave up on its first pass. The cap is a safety net rather than
+# load-bearing — a loopback connect either completes or is refused at once — so
+# `env`, a transparent prefix, stands in where `timeout` is absent.
+if command -v timeout >/dev/null 2>&1; then _PORT_PROBE=(timeout 1); else _PORT_PROBE=(env); fi
+proxy_port_open() { "${_PORT_PROBE[@]}" bash -c ">/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
+# locate a proxy asset across source (../proxy) and brew (../libexec/proxy)
+# layouts. This keeps the guest-side gh wrapper versioned with the host proxy.
 # locate a proxy asset across source (../proxy) and brew (../libexec/proxy)
 # layouts. This keeps the guest-side gh wrapper versioned with the host proxy.
 proxy_asset() {
@@ -1050,6 +1066,23 @@ proxy_stop_process() {
   return 1
 }
 
+# Start a long-lived process in a session of its own: no controlling terminal,
+# and no SIGINT from a Ctrl-C aimed at devbox. macOS ships no `setsid`, so fall
+# back to python3 — already a hard dependency — which execs in place and so
+# leaves `$!` naming the process itself, as the pid file expects.
+spawn_detached() { # $1 log file, $2.. command
+  local logf="$1"; shift
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" >"$logf" 2>&1 </dev/null &
+  else
+    python3 -c 'import os, sys
+try:
+    os.setsid()
+except OSError:
+    pass  # already a session leader; the redirects still detach us
+os.execvp(sys.argv[1], sys.argv[1:])' "$@" >"$logf" 2>&1 </dev/null &
+  fi
+}
 # start the host proxy if it isn't already up (idempotent). Shared across boxes.
 proxy_ensure() {
   local url="$1" port launcher logf i
@@ -1073,7 +1106,7 @@ proxy_ensure() {
   [[ -f "$CONFIG_DIR/api-keys.env" || -f "$CONFIG_DIR/proxy.config.json" || -f "$HOME/.claude/.credentials.json" ]] \
     || warn "no Anthropic key or host Claude login found — configure ~/.config/devbox/api-keys.env or run 'claude login'"
   log "Starting credential proxy on :$port  ($launcher)"
-  setsid "$launcher" >"$logf" 2>&1 </dev/null &
+  spawn_detached "$logf" "$launcher"
   echo $! > "$CONFIG_DIR/proxy.pid"
   for i in $(seq 1 20); do proxy_health "$port" && break; sleep 0.2; done
   if proxy_health "$port"; then log "credential proxy up (pid $(cat "$CONFIG_DIR/proxy.pid" 2>/dev/null), log: $logf)"
@@ -1495,11 +1528,52 @@ agent_config_files() { # paths -> NUL-delimited regular files
     elif [[ -d "$path" ]]; then
       # A user may keep an allowlisted config directory (notably
       # ~/.claude/hooks) in a separate, versioned vault.  Follow only the
-      # path supplied by the allowlist; links encountered beneath it remain
-      # untouched, so a config tree cannot pull arbitrary host files in.
-      find -H "$path" -type f -print0
+      # path supplied by the allowlist; links encountered beneath it are
+      # reported as links rather than descended into, so a config tree cannot
+      # pull arbitrary host files in.
+      # A marketplace or plugin tree is a git clone. Its objects are binary, so
+      # the credential screen would reject them one by one, and a partial .git
+      # is worth nothing in the guest anyway.
+      find -H "$path" -name .git -prune -o \( -type f -o -type l \) -print0
     fi
   done
+}
+
+# A link inside a config tree is part of that tree's layout: a marketplace
+# registered from a directory points at the plugin it provides, and a skill
+# shared between plugins is a link to its sibling. Dropping those left the guest
+# holding a marketplace entry with no plugin behind it. Print the target a copy
+# of this link should have in the guest, relative so it resolves under the
+# guest's different home, and fail for a target outside the copied home rather
+# than following it out.
+agent_config_link_target() { # $1 link, $2 path relative to $HOME
+  python3 - "$1" "$2" "$HOME" <<'LINKPY'
+import os
+import sys
+
+link, rel, home = sys.argv[1:4]
+target = os.path.realpath(link)
+home = os.path.realpath(home)
+if target != home and not target.startswith(home + os.sep):
+    raise SystemExit(1)
+if not os.path.exists(target):
+    raise SystemExit(1)
+print(os.path.relpath(target, os.path.join(home, os.path.dirname(rel))))
+LINKPY
+}
+
+# Which files the credential screen below applies to. A credential lives in a
+# config file, and screening anything else costs more than it buys: a plugin
+# tree is a git clone of a public marketplace, and its hooks and scripts talk
+# about `api_key = os.environ.get(...)` or `password=****` in prose and code.
+# Rejecting those silently broke every plugin that needed them, while turning
+# up no secret in any of them. Code, documentation, and binaries are therefore
+# copied as they are — a credential written into one of those reaches the guest.
+agent_config_is_screened() { # $1 path
+  case "${1##*/}" in
+    *.json|*.jsonc|*.toml|*.yaml|*.yml|*.ini|*.cfg|*.conf|*.env|.env*) return 0;;
+  esac
+  return 1
 }
 
 agent_config_contains_credential() { # $1 config file; never prints its content
@@ -1516,24 +1590,94 @@ agent_config_contains_credential() { # $1 config file; never prints its content
   LC_ALL=C grep -IEq "$field_assignment|(sk-(proj-|ant-)?|rk-live-|sess-)[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{12,}\\.[A-Za-z0-9_-]{12,}\\.[A-Za-z0-9_-]{8,}" "$file"
 }
 
-apply_agent_config() {
-  local name="$1" file rel parent copied=0 skipped=0
-  log "Copying non-secret host AI agent configuration into $name…"
+# Config copied from the host names host paths. The guest home is a different
+# directory, so a marketplace registered from a directory — and every plugin it
+# provides — is dropped on startup unless its prefix is rewritten. Only these
+# files are touched, and only their host-home prefix.
+HOME_PREFIXED_CONFIGS=(
+  ".claude/settings.json"
+  ".claude/settings.local.json"
+  ".claude/plugins/known_marketplaces.json"
+  ".claude/plugins/installed_plugins.json"
+)
+
+rewrite_staged_home_prefix() { # $1 staging root $2 guest home
+  local stage="$1" guest_home="$2" rel file
+  [[ -n "$guest_home" && "$guest_home" != "$HOME" ]] || return 0
+  for rel in "${HOME_PREFIXED_CONFIGS[@]}"; do
+    file="$stage/$rel"
+    [[ -f "$file" ]] || continue
+    # Not nested inside $( ): see claude_trust_config for why bash 3.2 must be
+    # able to parse this file even though it refuses to run it.
+    python3 - "$file" "$HOME" "$guest_home" <<'PY'
+import pathlib, sys
+path, host_home, guest_home = sys.argv[1:4]
+target = pathlib.Path(path)
+text = target.read_text()
+if host_home in text:
+    target.write_text(text.replace(host_home, guest_home))
+PY
+  done
+}
+
+# Screen the allowlist into a staging tree mirroring $HOME. Prints
+# "copied<TAB>skipped"; the caller ships the whole tree in one go.
+stage_agent_config() { # $1 staging root
+  local stage="$1" file rel target copied=0 skipped=0
   while IFS= read -r -d '' file; do
     case "$file" in "$HOME/"*) rel="${file#"$HOME"/}";; *) continue;; esac
-    if agent_config_contains_credential "$file"; then
+    # A link is staged as a link. Its target is screened on its own merits when
+    # the copy reaches it, and a target that is never copied leaves the guest a
+    # dangling link rather than a way out to the host.
+    if [[ -L "$file" ]]; then
+      if ! target="$(agent_config_link_target "$file" "$rel" 2>/dev/null)"; then
+        warn "skipping agent config link outside the copied home: $rel"
+        skipped=$((skipped+1))
+        continue
+      fi
+      mkdir -p "$stage/$(dirname "$rel")"
+      if ln -sfn "$target" "$stage/$rel" 2>/dev/null; then
+        copied=$((copied+1))
+      else
+        warn "could not stage agent config link: $rel"
+      fi
+      continue
+    fi
+    if agent_config_is_screened "$file" && agent_config_contains_credential "$file"; then
       warn "skipping possible credential in agent config: $rel"
       skipped=$((skipped+1))
       continue
     fi
-    parent="$(dirname "$rel")"
-    limactl shell "$name" -- bash -c "cd; mkdir -p '$parent'" </dev/null 2>/dev/null || true
-    if limactl copy "$file" "$name:$rel" 2>/dev/null; then
+    mkdir -p "$stage/$(dirname "$rel")"
+    if cp -p "$file" "$stage/$rel" 2>/dev/null; then
       copied=$((copied+1))
     else
-      warn "could not copy agent config: $rel"
+      warn "could not stage agent config: $rel"
     fi
   done < <(agent_config_files "${AGENT_CONFIG_PATHS[@]}")
+  printf '%s\t%s\n' "$copied" "$skipped"
+}
+
+apply_agent_config() {
+  local name="$1" stage guest_home copied=0 skipped=0 archive=".devbox-agent-config.tar"
+  log "Copying non-secret host AI agent configuration into ${name}…"
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/devbox-agent-config.XXXXXX")" || {
+    warn "could not create a staging directory for agent configuration"; return 0; }
+  IFS=$'\t' read -r copied skipped < <(stage_agent_config "$stage")
+  guest_home="$(limactl shell "$name" -- bash -lc 'printf %s "$HOME"' </dev/null 2>/dev/null || true)"
+  rewrite_staged_home_prefix "$stage" "$guest_home"
+  # One archive instead of one `limactl copy` per file: the plugin trees are
+  # hundreds of files, and every copy is its own SSH round trip.
+  if [[ "$copied" -gt 0 ]] \
+     && ! { tar -C "$stage" -cf "$stage.tar" . \
+            && limactl copy "$stage.tar" "$name:$archive" 2>/dev/null \
+            && limactl shell "$name" -- \
+                 bash -c "cd && tar -xmf '$archive' && rm -f '$archive'" </dev/null 2>/dev/null; }
+  then
+    warn "could not install agent configuration in $name"
+    copied=0
+  fi
+  rm -rf "$stage" "$stage.tar"
   log "Copied $copied non-secret agent config file(s); skipped $skipped possible credential(s)."
 }
 
@@ -1562,15 +1706,27 @@ PY
 set -euo pipefail
 state="$1"
 umask 077
+
+# Everything below $state lives on the host mount, and a mount need not accept
+# chmod at all: macOS Lima refuses it outright, which used to abort this script
+# under errexit and take the whole box down with it. The modes are already
+# right without it — the host creates the state root 700 and verifies its
+# owner, and the umask above covers anything created here — so tightening them
+# is a best-effort second line rather than the guarantee.
+harden() { # $1 mode, $2.. path
+  mode="$1"; shift
+  chmod "$mode" "$@" 2>/dev/null || true
+}
+
 mkdir -p "$state" "$state/claude" "$state/codex" "$state/opencode" \
   "$state/pi" "$state/stado"
-chmod 700 "$state" "$state/claude" "$state/codex" "$state/opencode" \
+harden 700 "$state" "$state/claude" "$state/codex" "$state/opencode" \
   "$state/pi" "$state/stado"
 
 link_dir() { # $1 guest path $2 path relative to state root
   src="$1"; dst="$state/$2"
   mkdir -p "$(dirname "$src")" "$(dirname "$dst")" "$dst"
-  chmod 700 "$dst"
+  harden 700 "$dst"
   if [ -L "$src" ]; then
     current="$(readlink -f "$src" 2>/dev/null || true)"
     if [ "$current" = "$dst" ]; then return 0; fi
@@ -1608,7 +1764,7 @@ link_append_file() { # append-only history/index file
   else
     touch "$dst"
   fi
-  chmod 600 "$dst"
+  harden 600 "$dst"
   ln -s "$dst" "$src"
 }
 
@@ -2107,7 +2263,7 @@ cmd_build() {
     "$digest" "$provision" "$provision_user"
   if instance_exists "$golden"; then
     if [[ $force -eq 1 ]]; then
-      log "Rebuilding golden $golden…"
+      log "Rebuilding golden ${golden}…"
       limactl stop -f "$golden" 2>/dev/null || true; limactl delete -f "$golden"
     else
       log "Golden $golden already exists (use 'devbox build --image $image --force' to rebuild)."
@@ -2373,7 +2529,7 @@ cmd_run() {
   trap run_cleanup EXIT INT TERM
 
   if [[ "$(instance_status "$name")" != "Running" ]]; then
-    log "Booting $name…"; limactl start "$name"
+    log "Booting ${name}…"; limactl start "$name"
   fi
   [[ $ssh_agent -eq 1 ]] && apply_git_signing "$name"
 

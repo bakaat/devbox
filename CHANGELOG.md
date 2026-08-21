@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+- Copy the Claude Code plugin trees under `--with-agent-config`. `settings.json`
+  carries `enabledPlugins`, so without `installed_plugins.json`,
+  `known_marketplaces.json`, and the `marketplaces`, `cache`, and `user` trees
+  the guest starts with plugins enabled and nothing to load them from.
+- Ship agent configuration as one archive instead of one `limactl copy` per
+  file, which is hundreds of SSH round trips once plugin trees are included.
+- Rewrite the host-home prefix in the copied `settings.json` and plugin
+  registries, so a marketplace registered from a directory still resolves under
+  the guest's different home.
+- Carry the symlinks inside a copied config tree, relative so they resolve in
+  the guest; a link pointing out of the copied home is refused, not followed.
+  Without them a directory marketplace arrived with no plugin behind it.
+- Screen only config-shaped files for credentials. Plugin code and docs discuss
+  `api_key = os.environ.get(...)` and `password=****`, and images are not text,
+  so the screen rejected the hooks and scripts plugins need.
+- Start the credential proxy on hosts without `setsid`, and stop
+  `proxy_port_open` reporting every port closed on hosts without GNU `timeout`.
+  Both are absent on macOS.
+- Keep session linking alive on a host mount that refuses `chmod`, which macOS
+  Lima does. The guest's `umask` and the host's own permissions already cover
+  the modes; the failure took the whole box down.
+- Brace the `$var…` log messages. In a UTF-8 locale bash reads the following
+  multibyte character as part of the variable name and `set -u` aborts.
+- Resolve the tmpdir symlink in the `sessions path` test, which failed on
+  macOS's `/var` → `/private/var` link.
+
 ## v1.3.3 - 2026-08-21
 
 - Create goldens with `--mount-none` and clones with `--mount-only`, so a box
