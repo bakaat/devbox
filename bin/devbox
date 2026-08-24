@@ -1103,7 +1103,15 @@ proxy_ensure() {
   fi
   launcher="$(proxy_launcher)" || { warn "proxy launcher not found — start it manually (devbox-ai-proxy)"; return 0; }
   mkdir -p "$CONFIG_DIR"; logf="$CONFIG_DIR/proxy.log"
-  [[ -f "$CONFIG_DIR/api-keys.env" || -f "$CONFIG_DIR/proxy.config.json" || -f "$HOME/.claude/.credentials.json" ]] \
+  # macOS Claude Code stores its login in the login keychain, not in
+  # ~/.claude/.credentials.json, so check there too before claiming there is no
+  # credential to forward.
+  host_claude_login() {
+    [[ -f "$HOME/.claude/.credentials.json" ]] && return 0
+    [[ "$(uname -s)" == Darwin ]] || return 1
+    security find-generic-password -s 'Claude Code-credentials' >/dev/null 2>&1
+  }
+  [[ -f "$CONFIG_DIR/api-keys.env" || -f "$CONFIG_DIR/proxy.config.json" ]] || host_claude_login \
     || warn "no Anthropic key or host Claude login found — configure ~/.config/devbox/api-keys.env or run 'claude login'"
   log "Starting credential proxy on :$port  ($launcher)"
   spawn_detached "$logf" "$launcher"

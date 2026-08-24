@@ -27,6 +27,12 @@
   multibyte character as part of the variable name and `set -u` aborts.
 - Resolve the tmpdir symlink in the `sessions path` test, which failed on
   macOS's `/var` → `/private/var` link.
+- Read the host Claude login from the macOS login keychain. Claude Code stores
+  it there rather than in `~/.claude/.credentials.json`, so on a Mac host the
+  proxy had no Anthropic credential and every guest call returned
+  `503 authentication source is unavailable`. A refresh taken from the keychain
+  is written back to it, so the host's own Claude Code does not diverge, and a
+  credentials file still takes precedence where one exists.
 
 ## v1.3.3 - 2026-08-21
 
